@@ -1,0 +1,452 @@
+name: Build Private Mircon Bygg Source
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private source branch, tag, or commit SHA to build
+        required: true
+        default: main
+        type: string
+      release_tag:
+        description: Private source release tag. Blank creates build-YYYYMMDD-HHMMSS.
+        required: false
+        type: string
+      prerelease:
+        description: Mark the private source release as a prerelease
+        required: true
+        default: true
+        type: boolean
+      run_tests:
+        description: Run backend/frontend/contract checks before packaging
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mircon-builder-${{ github.event.inputs.source_ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: deepak-vilje/mircon-bygg
+  PYTHON_VERSION: '3.12'
+  NODE_VERSION: '22'
+
+jobs:
+  gate:
+    name: Open Private Source Release
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Resolve private source ref
+        id: source
+        shell: bash
+        env:
+          SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SOURCE_REPO_TOKEN}" ]; then
+            echo "SOURCE_REPO_TOKEN secret is required."
+            exit 1
+          fi
+
+          mkdir source
+          git -C source init
+          git -C source remote add origin "https://x-access-token:${SOURCE_REPO_TOKEN}@github.com/${SOURCE_REPO}.git"
+
+          if ! git -C source fetch --depth=1 origin "${SOURCE_REF}"; then
+            if ! git -C source fetch --depth=1 origin "refs/heads/${SOURCE_REF}"; then
+              git -C source fetch --depth=1 origin "refs/tags/${SOURCE_REF}"
+            fi
+          fi
+
+          git -C source checkout --detach FETCH_HEAD
+          source_sha="$(git -C source rev-parse HEAD)"
+          echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${SOURCE_REPO}@${SOURCE_REF} to ${source_sha}"
+
+      - name: Compute release tag
+        id: release
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${REQUESTED_TAG}" ]; then
+            tag="${REQUESTED_TAG}"
+          else
+            tag="build-$(date -u +%Y%m%d-%H%M%S)"
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${tag}"
+
+      - name: Create private source release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          GH_REPO: ${{ env.SOURCE_REPO }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          prerelease_flag=""
+          if [ "${PRERELEASE}" = "true" ]; then
+            prerelease_flag="--prerelease"
+          fi
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "Release '${RELEASE_TAG}' already exists; build jobs will upload to it."
+          else
+            gh release create "${RELEASE_TAG}" \
+              --title "Build ${RELEASE_TAG}" \
+              --target "${SOURCE_SHA}" \
+              --notes "Built from ${SOURCE_REPO}@${SOURCE_SHA} by ${GITHUB_REPOSITORY}." \
+              ${prerelease_flag}
+          fi
+
+  backend_tests:
+    name: Backend Tests
+    runs-on: ubuntu-latest
+    needs: gate
+    if: ${{ inputs.run_tests }}
+    steps:
+      - name: Clone private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ needs.gate.outputs.source_sha }}
+          path: source
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        working-directory: source
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff==0.8.* pytest-cov==6.* pytest-timeout==2.*
+
+      - name: Lint (ruff)
+        working-directory: source
+        continue-on-error: true
+        run: ruff check app/ tests/
+
+      - name: Run pytest
+        working-directory: source
+        timeout-minutes: 30
+        run: pytest tests/ -q --cov=app --cov-report=term --cov-fail-under=0 --timeout=60 --timeout-method=thread
+
+  frontend_tests:
+    name: Frontend Tests
+    runs-on: ubuntu-latest
+    needs: gate
+    if: ${{ inputs.run_tests }}
+    steps:
+      - name: Clone private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ needs.gate.outputs.source_sha }}
+          path: source
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        working-directory: source/frontend
+        run: npm ci
+
+      - name: Type-check
+        working-directory: source/frontend
+        run: npx tsc --noEmit
+
+      - name: Lint (eslint)
+        working-directory: source/frontend
+        continue-on-error: true
+        run: npm run lint
+
+      - name: Run vitest
+        working-directory: source/frontend
+        run: npm test -- --run
+
+      - name: Run Playwright e2e when present
+        working-directory: source/frontend
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          specs=(e2e/**/*.spec.ts)
+          if [ "${#specs[@]}" -eq 0 ]; then
+            echo "No Playwright specs found; skipping e2e."
+            exit 0
+          fi
+          npx playwright install --with-deps chromium
+          npx playwright test --reporter=line
+
+  llm_contract:
+    name: LLM Contract Frozen Check
+    runs-on: ubuntu-latest
+    needs: gate
+    if: ${{ inputs.run_tests }}
+    steps:
+      - name: Clone private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ needs.gate.outputs.source_sha }}
+          path: source
+          fetch-depth: 0
+
+      - name: Verify LLM-contract files unchanged
+        working-directory: source
+        run: bash scripts/check_llm_contract_frozen.sh
+
+  build:
+    name: Build ${{ matrix.os_label }} ${{ matrix.variant }}
+    needs: [gate, backend_tests, frontend_tests, llm_contract]
+    if: ${{ always() && needs.gate.result == 'success' && (!inputs.run_tests || (needs.backend_tests.result == 'success' && needs.frontend_tests.result == 'success' && needs.llm_contract.result == 'success')) }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        variant: [prod, dev]
+        include:
+          - os: ubuntu-latest
+            os_label: linux
+            bin_suffix: ''
+          - os: macos-latest
+            os_label: macos
+            bin_suffix: ''
+          - os: windows-latest
+            os_label: windows
+            bin_suffix: '.exe'
+    steps:
+      - name: Clone private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          ref: ${{ needs.gate.outputs.source_sha }}
+          path: source
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Python dependencies
+        working-directory: source
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Install frontend dependencies
+        working-directory: source/frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: source/frontend
+        run: npm run build
+
+      - name: Seed bundle-time .env from .env.example
+        working-directory: source
+        shell: bash
+        run: cp .env.example .env
+
+      - name: Build binary
+        working-directory: source
+        shell: bash
+        env:
+          MIRCON_BUILD_VARIANT: ${{ matrix.variant }}
+        run: pyinstaller mircon-bygg.spec --noconfirm
+
+      - name: Determine binary name
+        id: binname
+        shell: bash
+        run: |
+          if [ "${{ matrix.variant }}" = "dev" ]; then
+            base="MirconBygg-dev"
+          else
+            base="MirconBygg"
+          fi
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+          echo "file=${base}${{ matrix.bin_suffix }}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify binary exists
+        if: matrix.os != 'macos-latest'
+        working-directory: source
+        shell: bash
+        run: |
+          path="dist/${{ steps.binname.outputs.file }}"
+          if [ ! -f "$path" ]; then
+            echo "Missing: $path"
+            ls -la dist/ || true
+            exit 1
+          fi
+          du -h "$path"
+
+      - name: Rename with OS suffix
+        if: matrix.os != 'macos-latest'
+        working-directory: source
+        shell: bash
+        run: |
+          src="dist/${{ steps.binname.outputs.file }}"
+          dst="dist/${{ steps.binname.outputs.base }}-${{ matrix.os_label }}${{ matrix.bin_suffix }}"
+          mv "$src" "$dst"
+          ls -la dist/
+
+      - name: Upload binary to private source release
+        if: matrix.os != 'macos-latest'
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          GH_REPO: ${{ env.SOURCE_REPO }}
+        run: |
+          tag='${{ needs.gate.outputs.tag }}'
+          file="dist/${{ steps.binname.outputs.base }}-${{ matrix.os_label }}${{ matrix.bin_suffix }}"
+          gh release upload "$tag" "$file" --clobber
+          echo "Uploaded $file to ${GH_REPO} release $tag"
+
+      - name: Verify .app bundle exists
+        if: matrix.os == 'macos-latest'
+        working-directory: source
+        shell: bash
+        run: |
+          app="dist/${{ steps.binname.outputs.base }}.app"
+          if [ ! -d "$app" ]; then
+            echo "Missing: $app"
+            ls -la dist/ || true
+            exit 1
+          fi
+          inner="$app/Contents/MacOS/${{ steps.binname.outputs.base }}"
+          if [ ! -x "$inner" ]; then
+            echo "Bundle exists but inner exe missing/not executable: $inner"
+            ls -la "$app/Contents/MacOS/" || true
+            exit 1
+          fi
+          du -sh "$app"
+
+      - name: Build .dmg from .app
+        if: matrix.os == 'macos-latest'
+        working-directory: source
+        shell: bash
+        run: |
+          base='${{ steps.binname.outputs.base }}'
+          app="dist/${base}.app"
+          dmg="dist/${base}-${{ matrix.os_label }}.dmg"
+          volname="Mircon Bygg"
+          if [ '${{ matrix.variant }}' = 'dev' ]; then
+            volname="Mircon Bygg (dev)"
+          fi
+          hdiutil create \
+            -volname "$volname" \
+            -srcfolder "$app" \
+            -ov \
+            -format UDZO \
+            "$dmg"
+          ls -la "$dmg"
+          du -h "$dmg"
+
+      - name: Upload .dmg to private source release
+        if: matrix.os == 'macos-latest'
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          GH_REPO: ${{ env.SOURCE_REPO }}
+        run: |
+          tag='${{ needs.gate.outputs.tag }}'
+          file="dist/${{ steps.binname.outputs.base }}-${{ matrix.os_label }}.dmg"
+          gh release upload "$tag" "$file" --clobber
+          echo "Uploaded $file to ${GH_REPO} release $tag"
+
+  finalize:
+    name: Attach Runtime Env And Prune
+    runs-on: ubuntu-latest
+    needs: [gate, build]
+    if: ${{ success() }}
+    steps:
+      - name: Materialize runtime .env from builder secrets
+        shell: bash
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+        run: |
+          python3 - <<'PY'
+          import os
+          pairs = [
+              ("AI_PROVIDER", "anthropic"),
+              ("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY", "")),
+              ("ANTHROPIC_BASE_URL", os.environ.get("ANTHROPIC_BASE_URL", "")),
+              ("ANTHROPIC_MODEL", os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-7")),
+              ("ANTHROPIC_MAX_TOKENS", "32000"),
+              ("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", "")),
+              ("OPENAI_BASE_URL", os.environ.get("OPENAI_BASE_URL", "")),
+              ("OPENAI_MODEL", os.environ.get("OPENAI_MODEL", "gpt-4o")),
+              ("OPENAI_MAX_TOKENS", "4096"),
+              ("DEFAULT_LANGUAGE", "sv"),
+              ("LOG_LEVEL", "INFO"),
+          ]
+          with open(".env", "w", encoding="utf-8", newline="\n") as f:
+              for key, value in pairs:
+                  f.write(f"{key}={value}\n")
+          print(".env written ({} keys)".format(len(pairs)))
+          PY
+
+      - name: Upload .env to private source release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          GH_REPO: ${{ env.SOURCE_REPO }}
+        run: |
+          tag='${{ needs.gate.outputs.tag }}'
+          gh release upload "$tag" .env --clobber
+
+      - name: Prune old private source releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+          GH_REPO: ${{ env.SOURCE_REPO }}
+        run: |
+          set -euo pipefail
+          keep=4
+          mapfile -t all_tags < <(gh release list --limit 50 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .[].tagName')
+
+          if [ "${#all_tags[@]}" -le "$keep" ]; then
+            echo "Only ${#all_tags[@]} releases exist; nothing to prune."
+            exit 0
+          fi
+
+          to_delete=("${all_tags[@]:$keep}")
+          echo "Will delete ${#to_delete[@]} older release(s): ${to_delete[*]}"
+          for tag in "${to_delete[@]}"; do
+            gh release delete "$tag" --yes --cleanup-tag || {
+              echo "Release delete failed for $tag; continuing."
+            }
+          done
