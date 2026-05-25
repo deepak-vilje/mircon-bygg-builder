@@ -249,10 +249,37 @@ jobs:
         working-directory: source/frontend
         run: npm run build
 
-      - name: Seed bundle-time .env from .env.example
+      - name: Materialize bundle-time .env from secrets
         working-directory: source
         shell: bash
-        run: cp .env.example .env
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+          ANTHROPIC_MODEL: ${{ secrets.ANTHROPIC_MODEL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+        run: |
+          python3 - <<'PY'
+          import os
+          pairs = [
+              ("AI_PROVIDER", "anthropic"),
+              ("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY", "")),
+              ("ANTHROPIC_BASE_URL", os.environ.get("ANTHROPIC_BASE_URL", "")),
+              ("ANTHROPIC_MODEL", os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-7")),
+              ("ANTHROPIC_MAX_TOKENS", "32000"),
+              ("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", "")),
+              ("OPENAI_BASE_URL", os.environ.get("OPENAI_BASE_URL", "")),
+              ("OPENAI_MODEL", os.environ.get("OPENAI_MODEL", "gpt-4o")),
+              ("OPENAI_MAX_TOKENS", "4096"),
+              ("DEFAULT_LANGUAGE", "sv"),
+              ("LOG_LEVEL", "INFO"),
+          ]
+          with open(".env", "w", encoding="utf-8", newline="\n") as f:
+              for key, value in pairs:
+                  f.write(f"{key}={value}\n")
+          print(".env written ({} keys)".format(len(pairs)))
+          PY
 
       - name: Build binary
         working-directory: source

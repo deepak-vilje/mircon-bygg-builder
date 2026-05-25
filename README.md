@@ -19,8 +19,8 @@ Use a fine-grained PAT scoped only to `deepak-vilje/mircon-bygg` with:
 - `Contents: Read and write` (clone source and create/upload releases)
 - `Metadata: Read`
 
-Optional builder-repo secrets, used only to attach a runtime `.env` release
-asset:
+Optional builder-repo secrets, used to generate the bundle-time `.env` and
+attach the runtime `.env` release asset:
 
 - `ANTHROPIC_API_KEY`
 - `ANTHROPIC_BASE_URL`
