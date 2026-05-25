@@ -18,7 +18,7 @@ on:
         default: true
         type: boolean
       run_tests:
-        description: Run backend/frontend/contract checks before packaging
+        description: Run backend/frontend checks before packaging
         required: true
         default: true
         type: boolean
@@ -198,29 +198,10 @@ jobs:
           npx playwright install --with-deps chromium
           npx playwright test --reporter=line
 
-  llm_contract:
-    name: LLM Contract Frozen Check
-    runs-on: ubuntu-latest
-    needs: gate
-    if: ${{ inputs.run_tests }}
-    steps:
-      - name: Clone private source
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          token: ${{ secrets.SOURCE_REPO_TOKEN }}
-          ref: ${{ needs.gate.outputs.source_sha }}
-          path: source
-          fetch-depth: 0
-
-      - name: Verify LLM-contract files unchanged
-        working-directory: source
-        run: bash scripts/check_llm_contract_frozen.sh
-
   build:
     name: Build ${{ matrix.os_label }} ${{ matrix.variant }}
-    needs: [gate, backend_tests, frontend_tests, llm_contract]
-    if: ${{ always() && needs.gate.result == 'success' && (!inputs.run_tests || (needs.backend_tests.result == 'success' && needs.frontend_tests.result == 'success' && needs.llm_contract.result == 'success')) }}
+    needs: [gate, backend_tests, frontend_tests]
+    if: ${{ always() && needs.gate.result == 'success' && (!inputs.run_tests || (needs.backend_tests.result == 'success' && needs.frontend_tests.result == 'success')) }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

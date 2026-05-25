@@ -39,7 +39,9 @@ From the builder repo UI, run **Build Private Mircon Bygg Source** and set:
 
 - `source_ref`: `main`, a tag, or a commit SHA from the private source repo.
 - `release_tag`: optional. Leave blank for `build-YYYYMMDD-HHMMSS`.
-- `run_tests`: keep enabled unless you need a packaging-only rebuild.
+- `run_tests`: keep enabled unless you need a packaging-only rebuild. This runs
+  backend and frontend checks; the LLM contract guard remains a private-repo PR
+  policy rather than a manual release-build gate.
 
 Equivalent CLI:
 
