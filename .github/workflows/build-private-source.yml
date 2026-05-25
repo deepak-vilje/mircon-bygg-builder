@@ -328,28 +328,19 @@ jobs:
           fi
           du -sh "$app"
 
-      - name: Build .dmg from .app
+      - name: Zip .app bundle
         if: matrix.os == 'macos-latest'
         working-directory: source
         shell: bash
         run: |
           base='${{ steps.binname.outputs.base }}'
           app="dist/${base}.app"
-          dmg="dist/${base}-${{ matrix.os_label }}.dmg"
-          volname="Mircon Bygg"
-          if [ '${{ matrix.variant }}' = 'dev' ]; then
-            volname="Mircon Bygg (dev)"
-          fi
-          hdiutil create \
-            -volname "$volname" \
-            -srcfolder "$app" \
-            -ov \
-            -format UDZO \
-            "$dmg"
-          ls -la "$dmg"
-          du -h "$dmg"
+          zip="dist/${base}-${{ matrix.os_label }}.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$zip"
+          ls -la "$zip"
+          du -h "$zip"
 
-      - name: Upload .dmg to private source release
+      - name: Upload .app bundle to private source release
         if: matrix.os == 'macos-latest'
         working-directory: source
         shell: bash
@@ -358,7 +349,7 @@ jobs:
           GH_REPO: ${{ env.SOURCE_REPO }}
         run: |
           tag='${{ needs.gate.outputs.tag }}'
-          file="dist/${{ steps.binname.outputs.base }}-${{ matrix.os_label }}.dmg"
+          file="dist/${{ steps.binname.outputs.base }}-${{ matrix.os_label }}.app.zip"
           gh release upload "$tag" "$file" --clobber
           echo "Uploaded $file to ${GH_REPO} release $tag"
 
